@@ -252,12 +252,16 @@ async function checkStartPlanEvening() {
 // 朝6時タスク通知（JST 6:00 = UTC 21:00）
 // ========================================
 
+let lastMorningNotifyDate = null;
+
 async function sendMorningTaskNotifications() {
   const nowJST = new Date(Date.now() + 9 * 60 * 60 * 1000);
   const hourJST = nowJST.getUTCHours();
   if (hourJST !== 6) return;
 
   const today = getTodayJST();
+  if (lastMorningNotifyDate === today) return;
+  lastMorningNotifyDate = today;
 
   // 全ユーザーを取得
   const { data: users, error: userError } = await supabase
