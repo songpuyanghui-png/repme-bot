@@ -193,14 +193,15 @@ async function checkSchedulePlanLate() {
 // Start Plan 20時通知（JST）
 // 条件: JST 20:00台 + 当日未達成 + 当日未通知
 // ========================================
-
+let lastEveningNotifyDate = null;
 async function checkStartPlanEvening() {
   const nowJST = new Date(Date.now() + 9 * 60 * 60 * 1000);
   const hourJST = nowJST.getUTCHours();
   if (hourJST !== 20) return;
 
   const today = getTodayJST();
-
+if (lastEveningNotifyDate === today) return;
+  lastEveningNotifyDate = today;
   const { data: tasks, error } = await supabase
     .from('schedule_tasks')
     .select('*')
@@ -334,21 +335,7 @@ async function sendMorningTaskNotifications() {
 }
 
 
-// 起動時: 過去の未通知タスクを通知済みにする
-async function markPastTasksAsNotified() {
-  const now = new Date();
-  const { error } = await supabase
-    .from('schedule_tasks')
-    .update({ notified_count: 1 })
-    .eq('plan_type', 'schedule')
-    .eq('status', 'planned')
-    .lt('scheduled_start_at', now.toISOString())
-    .eq('notified_count', 0);
-  if (error) {
-    console.error('過去タスク通知済み処理失敗', error);
-  } else {
-    console.log('過去の未通知タスクを通知済みにしました');
-  }
+
 }function startIntervals() {
   setInterval(checkSchedulePlanLate, 60 * 1000);
   setInterval(checkStartPlanEvening, 5 * 60 * 1000);
@@ -371,8 +358,7 @@ client.once('ready', async () => {
   if (nowJST.getUTCHours() === 20) await checkStartPlanEvening();
 
   scheduleDailyGeneration();
-  await markPastTasksAsNotified();  startIntervals();
-});
+  startIntervals();
 
 // ========================================
 // メッセージ処理
@@ -474,11 +460,11 @@ client.on('messageCreate', async (message) => {
     return message.reply('週間スケジュール登録完了');
   }
 
-  if (content === '!in') {
+ if (content === '!in') {
     if (sessions[userId]) return message.reply('すでに作業中');
     const { data: user, error: userError } = await supabase.from('users').select('repme_code').eq('user_id', userId).single();
     if (userError || !user) return message.reply('先に !link で連携して');
-    const { data: tasks, error: taskError } = await supabase.from('schedule_tasks').select('*').eq('user_id', userId).eq('status', 'planned').order('start_time', { ascending: true }).limit(1);
+    const { data: tasks, error: taskError } = await supabase.from('schedule_tasks').select('*').eq('user_id', userId).eq('status', 'planned').order('scheduled_start_at', { ascending: true }).limit(1);
     if (taskError) return message.reply('task取得失敗');
     if (!tasks || tasks.length === 0) return message.reply('今日の予定がない。先に !plan して');
     const task = tasks[0];
