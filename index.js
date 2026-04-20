@@ -336,7 +336,9 @@ async function sendMorningTaskNotifications() {
 
 
 
-}function startIntervals() {
+}
+
+function startIntervals() {
   setInterval(checkSchedulePlanLate, 60 * 1000);
   setInterval(checkStartPlanEvening, 5 * 60 * 1000);
   setInterval(sendMorningTaskNotifications, 5 * 60 * 1000);
