@@ -56,13 +56,13 @@ function getTodayJST() {
 }
 
 const toJSTTime = (utcStr) => {
-  const d = new Date(utcStr + (utcStr.endsWith('Z') ? '' : 'Z'));
+  const d = new Date(utcStr);
   const jst = new Date(d.getTime() + 9 * 60 * 60 * 1000);
   return `${String(jst.getUTCHours()).padStart(2, '0')}:${String(jst.getUTCMinutes()).padStart(2, '0')}`;
 };
 
 const toJSTDate = (utcStr) => {
-  const d = new Date(utcStr + (utcStr.endsWith('Z') ? '' : 'Z'));
+  const d = new Date(utcStr);
   const jst = new Date(d.getTime() + 9 * 60 * 60 * 1000);
   return `${jst.getUTCMonth() + 1}月${jst.getUTCDate()}日`;
 };
