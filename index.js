@@ -520,7 +520,11 @@ client.on('messageCreate', async (message) => {
       task = startTasks && startTasks.length > 0 ? startTasks[0] : null;
     }
 
-    if (!task) return message.reply('今日の予定がない。先に !plan して');
+    // planなしの場合：task_id = null でそのまま開始
+    if (!task) {
+      sessions[userId] = { start: Date.now(), userName, repmeCode: user.repme_code, taskId: null };
+      return message.reply('作業開始。終わったら !out して');
+    }
 
     const { error: updateError } = await supabase.from('schedule_tasks').update({ status: 'in_progress' }).eq('id', task.id);
     if (updateError) return message.reply('task開始失敗');
@@ -539,8 +543,13 @@ client.on('messageCreate', async (message) => {
         type: 'realtime', start_time: new Date(session.start).toISOString(), end_time: new Date().toISOString()
       }]);
       if (logError) { console.error('!out work_logs保存失敗', logError); delete sessions[userId]; return message.reply('ログ保存失敗'); }
-      const { error: taskUpdateError } = await supabase.from('schedule_tasks').update({ status: 'completed' }).eq('id', session.taskId);
-      if (taskUpdateError) { delete sessions[userId]; return message.reply('ログは保存したけどtask完了更新失敗'); }
+
+      // taskId がある場合のみ schedule_tasks を更新
+      if (session.taskId !== null) {
+        const { error: taskUpdateError } = await supabase.from('schedule_tasks').update({ status: 'completed' }).eq('id', session.taskId);
+        if (taskUpdateError) { delete sessions[userId]; return message.reply('ログは保存したけどtask完了更新失敗'); }
+      }
+
       delete sessions[userId];
       return message.reply(`完了: ${minutes}分`);
     } catch (err) {
