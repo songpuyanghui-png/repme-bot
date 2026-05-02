@@ -474,10 +474,40 @@ client.on('messageCreate', async (message) => {
     if (sessions[userId]) return message.reply('すでに作業中');
     const { data: user, error: userError } = await supabase.from('users').select('repme_code').eq('user_id', userId).single();
     if (userError || !user) return message.reply('先に !link で連携して');
+<<<<<<< Updated upstream
     const { data: tasks, error: taskError } = await supabase.from('schedule_tasks').select('*').eq('user_id', userId).eq('status', 'planned').order('start_time', { ascending: true }).limit(1);
     if (taskError) return message.reply('task取得失敗');
     if (!tasks || tasks.length === 0) return message.reply('今日の予定がない。先に !plan して');
     const task = tasks[0];
+=======
+
+    const today = getTodayJST();
+    const { data: scheduleTasks, error: scheduleError } = await supabase
+      .from('schedule_tasks').select('*')
+      .eq('user_id', userId).eq('status', 'planned')
+      .eq('plan_type', 'schedule').eq('task_date', today)
+      .not('scheduled_start_at', 'is', null)
+      .order('scheduled_start_at', { ascending: true }).limit(1);
+    if (scheduleError) return message.reply('task取得失敗');
+
+    let task = scheduleTasks && scheduleTasks.length > 0 ? scheduleTasks[0] : null;
+
+    if (!task) {
+      const { data: startTasks, error: startError } = await supabase
+        .from('schedule_tasks').select('*')
+        .eq('user_id', userId).eq('status', 'planned')
+        .eq('plan_type', 'start').eq('task_date', today).limit(1);
+      if (startError) return message.reply('task取得失敗');
+      task = startTasks && startTasks.length > 0 ? startTasks[0] : null;
+    }
+
+    // planなしの場合：task_id = null でそのまま開始
+    if (!task) {
+      sessions[userId] = { start: Date.now(), userName, repmeCode: user.repme_code, taskId: null };
+      return message.reply('作業開始。終わったら !out して');
+    }
+
+>>>>>>> Stashed changes
     const { error: updateError } = await supabase.from('schedule_tasks').update({ status: 'in_progress' }).eq('id', task.id);
     if (updateError) return message.reply('task開始失敗');
     sessions[userId] = { start: Date.now(), userName, repmeCode: user.repme_code, taskId: task.id };
@@ -495,8 +525,13 @@ client.on('messageCreate', async (message) => {
         type: 'realtime', start_time: new Date(session.start).toISOString(), end_time: new Date().toISOString()
       }]);
       if (logError) { console.error('!out work_logs保存失敗', logError); delete sessions[userId]; return message.reply('ログ保存失敗'); }
-      const { error: taskUpdateError } = await supabase.from('schedule_tasks').update({ status: 'completed' }).eq('id', session.taskId);
-      if (taskUpdateError) { delete sessions[userId]; return message.reply('ログは保存したけどtask完了更新失敗'); }
+
+      // taskId がある場合のみ schedule_tasks を更新
+      if (session.taskId !== null) {
+        const { error: taskUpdateError } = await supabase.from('schedule_tasks').update({ status: 'completed' }).eq('id', session.taskId);
+        if (taskUpdateError) { delete sessions[userId]; return message.reply('ログは保存したけどtask完了更新失敗'); }
+      }
+
       delete sessions[userId];
       return message.reply(`完了: ${minutes}分`);
     } catch (err) {
