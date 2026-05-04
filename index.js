@@ -97,20 +97,18 @@ function formatPlanList(tasks) {
 // 当日の総作業時間を取得（Start Plan達成判定用）
 // ========================================
 
-  async function getTodayTotalMinutes(userId) {
+async function getTodayTotalMinutes(userId) {
   const today = getTodayJST();
-  const jstOffset = 9 * 60 * 60 * 1000;
   const todayStartJST = new Date(today + 'T00:00:00+09:00');
   const todayEndJST = new Date(today + 'T23:59:59+09:00');
-
   const { data: logs } = await supabase
     .from('work_logs')
     .select('minutes')
     .eq('user_id', userId)
     .gte('start_time', todayStartJST.toISOString())
     .lte('start_time', todayEndJST.toISOString());
-
   return (logs || []).reduce((sum, l) => sum + (l.minutes || 0), 0);
+}
 
 // ========================================
 // Start Plan task自動生成
@@ -179,14 +177,12 @@ function scheduleDailyGeneration() {
 async function markPastTasksAsMissed() {
   const today = getTodayJST();
   const now = new Date();
-
   const { error: error1 } = await supabase
     .from('schedule_tasks')
     .update({ status: 'missed' })
     .eq('status', 'planned')
     .lt('task_date', today);
   if (error1) console.error('過去タスクmissed更新失敗', error1);
-
   const { error: error2 } = await supabase
     .from('schedule_tasks')
     .update({ status: 'missed' })
@@ -264,11 +260,9 @@ async function checkStartPlanEvening() {
     if (notifyingTaskIds.has(`start_${task.id}`)) continue;
     notifyingTaskIds.add(`start_${task.id}`);
     try {
-      // 当日の総作業時間で判定（task_idに関わらず全ログ合計）
       const totalLogged = await getTodayTotalMinutes(task.user_id);
       const target = task.target_minutes || 0;
       if (totalLogged >= target) {
-        // 達成済みならstatusをcompletedに更新して通知しない
         await supabase.from('schedule_tasks').update({ status: 'completed' }).eq('id', task.id);
         console.log(`Start Plan達成済みのため通知スキップ: ${task.repme_code} ${totalLogged}/${target}分`);
         notifyingTaskIds.delete(`start_${task.id}`);
@@ -566,7 +560,6 @@ client.on('messageCreate', async (message) => {
       }]);
       if (logError) { console.error('!out work_logs保存失敗', logError); delete sessions[userId]; return message.reply('ログ保存失敗'); }
 
-      // taskId がある場合のみ schedule_tasks を更新
       if (session.taskId !== null) {
         const { error: taskUpdateError } = await supabase.from('schedule_tasks').update({ status: 'completed' }).eq('id', session.taskId);
         if (taskUpdateError) { delete sessions[userId]; return message.reply('ログは保存したけどtask完了更新失敗'); }
