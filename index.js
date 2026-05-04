@@ -94,6 +94,25 @@ function formatPlanList(tasks) {
 }
 
 // ========================================
+// 当日の総作業時間を取得（Start Plan達成判定用）
+// ========================================
+
+  async function getTodayTotalMinutes(userId) {
+  const today = getTodayJST();
+  const jstOffset = 9 * 60 * 60 * 1000;
+  const todayStartJST = new Date(today + 'T00:00:00+09:00');
+  const todayEndJST = new Date(today + 'T23:59:59+09:00');
+
+  const { data: logs } = await supabase
+    .from('work_logs')
+    .select('minutes')
+    .eq('user_id', userId)
+    .gte('start_time', todayStartJST.toISOString())
+    .lte('start_time', todayEndJST.toISOString());
+
+  return (logs || []).reduce((sum, l) => sum + (l.minutes || 0), 0);
+
+// ========================================
 // Start Plan task自動生成
 // ========================================
 
@@ -245,12 +264,16 @@ async function checkStartPlanEvening() {
     if (notifyingTaskIds.has(`start_${task.id}`)) continue;
     notifyingTaskIds.add(`start_${task.id}`);
     try {
-      const { data: logs } = await supabase
-        .from('work_logs').select('minutes')
-        .eq('repme_code', task.repme_code).eq('task_id', task.id);
-      const totalLogged = (logs || []).reduce((sum, l) => sum + (l.minutes || 0), 0);
+      // 当日の総作業時間で判定（task_idに関わらず全ログ合計）
+      const totalLogged = await getTodayTotalMinutes(task.user_id);
       const target = task.target_minutes || 0;
-      if (totalLogged >= target) { notifyingTaskIds.delete(`start_${task.id}`); continue; }
+      if (totalLogged >= target) {
+        // 達成済みならstatusをcompletedに更新して通知しない
+        await supabase.from('schedule_tasks').update({ status: 'completed' }).eq('id', task.id);
+        console.log(`Start Plan達成済みのため通知スキップ: ${task.repme_code} ${totalLogged}/${target}分`);
+        notifyingTaskIds.delete(`start_${task.id}`);
+        continue;
+      }
       const discordUser = await client.users.fetch(task.user_id);
       await discordUser.send(`【作業リマインド】今日の作業はまだですか？\n目標：${target}分 / 記録：${totalLogged}分\nあと${target - totalLogged}分です。`);
       await supabase.from('schedule_tasks').update({
@@ -520,7 +543,6 @@ client.on('messageCreate', async (message) => {
       task = startTasks && startTasks.length > 0 ? startTasks[0] : null;
     }
 
-    // planなしの場合：task_id = null でそのまま開始
     if (!task) {
       sessions[userId] = { start: Date.now(), userName, repmeCode: user.repme_code, taskId: null };
       return message.reply('作業開始。終わったら !out して');
@@ -548,6 +570,26 @@ client.on('messageCreate', async (message) => {
       if (session.taskId !== null) {
         const { error: taskUpdateError } = await supabase.from('schedule_tasks').update({ status: 'completed' }).eq('id', session.taskId);
         if (taskUpdateError) { delete sessions[userId]; return message.reply('ログは保存したけどtask完了更新失敗'); }
+      }
+
+      // Start Plan達成チェック（当日の総作業時間で判定）
+      const today = getTodayJST();
+      const { data: startTaskRows } = await supabase
+        .from('schedule_tasks')
+        .select('id, target_minutes, status')
+        .eq('user_id', userId)
+        .eq('plan_type', 'start')
+        .eq('task_date', today)
+        .in('status', ['planned', 'in_progress', 'late'])
+        .limit(1);
+
+      const startTask = startTaskRows && startTaskRows.length > 0 ? startTaskRows[0] : null;
+      if (startTask && startTask.target_minutes) {
+        const totalMinutes = await getTodayTotalMinutes(userId);
+        if (totalMinutes >= startTask.target_minutes) {
+          await supabase.from('schedule_tasks').update({ status: 'completed' }).eq('id', startTask.id);
+          console.log(`Start Plan達成: ${session.repmeCode} ${totalMinutes}/${startTask.target_minutes}分`);
+        }
       }
 
       delete sessions[userId];
