@@ -396,7 +396,27 @@ client.on('messageCreate', async (message) => {
     }]);
     if (planError) { console.error('!startplan insert失敗', planError); return message.reply('Start Plan登録失敗'); }
     await generateStartPlanTask(user.repme_code, userId, targetMinutes);
-    return message.reply(`目標作業時間: ${targetMinutes}分`);
+
+// 当日のStart Plan taskを即時更新
+const today = getTodayJST();
+const { data: todayTask } = await supabase
+  .from('schedule_tasks')
+  .select('id, status')
+  .eq('user_id', userId)
+  .eq('plan_type', 'start')
+  .eq('task_date', today)
+  .in('status', ['planned', 'in_progress'])
+  .limit(1)
+  .single();
+
+if (todayTask) {
+  await supabase.from('schedule_tasks')
+    .update({ target_minutes: targetMinutes, title: `今日の目標: ${targetMinutes}分` })
+    .eq('id', todayTask.id);
+  return message.reply(`目標作業時間を${targetMinutes}分に更新しました。`);
+}
+
+return message.reply(`目標作業時間: ${targetMinutes}分`);
   }
 
   if (content.startsWith('!plan') && !content.startsWith('!plans')) {
