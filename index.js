@@ -111,6 +111,36 @@ async function getTodayTotalMinutes(userId) {
 }
 
 // ========================================
+// 連続作業日数を計算
+// ========================================
+
+async function calcStreak(userId) {
+  const jstOffset = 9 * 60 * 60 * 1000;
+  let streak = 0;
+  let checkDate = new Date(Date.now() + jstOffset);
+
+  while (true) {
+    const dateStr = `${checkDate.getUTCFullYear()}-${String(checkDate.getUTCMonth() + 1).padStart(2, '0')}-${String(checkDate.getUTCDate()).padStart(2, '0')}`;
+    const startUTC = new Date(dateStr + 'T00:00:00+09:00').toISOString();
+    const endUTC = new Date(dateStr + 'T23:59:59+09:00').toISOString();
+
+    const { data: logs } = await supabase
+      .from('work_logs')
+      .select('id')
+      .eq('user_id', userId)
+      .gte('start_time', startUTC)
+      .lte('start_time', endUTC)
+      .limit(1);
+
+    if (!logs || logs.length === 0) break;
+    streak++;
+    checkDate = new Date(checkDate.getTime() - 24 * 60 * 60 * 1000);
+  }
+
+  return streak;
+}
+
+// ========================================
 // Start Plan task自動生成
 // ========================================
 
@@ -605,8 +635,9 @@ return message.reply(`目標作業時間: ${targetMinutes}分`);
         }
       }
 
-      delete sessions[userId];
-      return message.reply(`完了: ${minutes}分`);
+      const streak = await calcStreak(userId);
+delete sessions[userId];
+return message.reply(`完了: ${minutes}分\n連続: ${streak}日`);
     } catch (err) {
       console.error('!out 例外', err);
       delete sessions[userId];
