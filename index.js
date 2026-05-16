@@ -164,6 +164,22 @@ async function calcTotalDays(userId) {
 }
 
 // ========================================
+// 当日のStart Plan taskを取得（status問わず）
+// ========================================
+
+async function getTodayStartTask(userId) {
+  const today = getTodayJST();
+  const { data: rows } = await supabase
+    .from('schedule_tasks')
+    .select('id, target_minutes, status')
+    .eq('user_id', userId)
+    .eq('plan_type', 'start')
+    .eq('task_date', today)
+    .limit(1);
+  return rows && rows.length > 0 ? rows[0] : null;
+}
+
+// ========================================
 // Start Plan task自動生成
 // ========================================
 
@@ -590,6 +606,8 @@ client.on('messageCreate', async (message) => {
     if (userError || !user) return message.reply('先に !link で連携して');
 
     const today = getTodayJST();
+
+    // Schedule Plan優先（planned限定）
     const { data: scheduleTasks, error: scheduleError } = await supabase
       .from('schedule_tasks').select('*')
       .eq('user_id', userId).eq('status', 'planned')
@@ -601,22 +619,37 @@ client.on('messageCreate', async (message) => {
     let task = scheduleTasks && scheduleTasks.length > 0 ? scheduleTasks[0] : null;
 
     if (!task) {
+      // Start Plan（planned / in_progress / completedも含めて当日taskを確認）
       const { data: startTasks, error: startError } = await supabase
         .from('schedule_tasks').select('*')
-        .eq('user_id', userId).eq('status', 'planned')
-        .eq('plan_type', 'start').eq('task_date', today).limit(1);
+        .eq('user_id', userId)
+        .eq('plan_type', 'start')
+        .eq('task_date', today)
+        .limit(1);
       if (startError) return message.reply('task取得失敗');
       task = startTasks && startTasks.length > 0 ? startTasks[0] : null;
     }
 
     if (!task) {
+      // Free Plan
       sessions[userId] = { start: Date.now(), userName, repmeCode: user.repme_code, taskId: null, planType: null, taskEndTime: null };
       return message.reply('作業開始。終わったら !out して');
     }
 
+    // Start Planは複数回!inできる（completedでも再アタッチ）
+    if (task.plan_type === 'start') {
+      // in_progress / planned なら status更新、completedはそのまま
+      if (task.status === 'planned') {
+        await supabase.from('schedule_tasks').update({ status: 'in_progress' }).eq('id', task.id);
+      }
+      sessions[userId] = { start: Date.now(), userName, repmeCode: user.repme_code, taskId: task.id, planType: 'start', taskEndTime: null };
+      return message.reply(`作業開始: ${task.title || '今日の目標'}`);
+    }
+
+    // Schedule Plan
     const { error: updateError } = await supabase.from('schedule_tasks').update({ status: 'in_progress' }).eq('id', task.id);
     if (updateError) return message.reply('task開始失敗');
-    sessions[userId] = { start: Date.now(), userName, repmeCode: user.repme_code, taskId: task.id, planType: task.plan_type, taskEndTime: task.end_time || null };
+    sessions[userId] = { start: Date.now(), userName, repmeCode: user.repme_code, taskId: task.id, planType: 'schedule', taskEndTime: task.end_time || null };
     return message.reply(`作業開始: ${task.title || '作業'}`);
   }
 
@@ -632,28 +665,19 @@ client.on('messageCreate', async (message) => {
       }]);
       if (logError) { console.error('!out work_logs保存失敗', logError); delete sessions[userId]; return message.reply('ログ保存失敗'); }
 
-      if (session.taskId !== null) {
+      // Schedule Planのみtask completed更新
+      if (session.taskId !== null && session.planType === 'schedule') {
         const { error: taskUpdateError } = await supabase.from('schedule_tasks').update({ status: 'completed' }).eq('id', session.taskId);
         if (taskUpdateError) { delete sessions[userId]; return message.reply('ログは保存したけどtask完了更新失敗'); }
       }
 
-      // Start Plan達成チェック（当日の総作業時間で判定）
-      const today = getTodayJST();
-      const { data: startTaskRows } = await supabase
-        .from('schedule_tasks')
-        .select('id, target_minutes, status')
-        .eq('user_id', userId)
-        .eq('plan_type', 'start')
-        .eq('task_date', today)
-        .in('status', ['planned', 'in_progress', 'late'])
-        .limit(1);
-
-      const startTask = startTaskRows && startTaskRows.length > 0 ? startTaskRows[0] : null;
-      if (startTask && startTask.target_minutes) {
+      // Start Plan達成チェック（当日総作業時間で判定・status問わず取得）
+      const todayStartTask = await getTodayStartTask(userId);
+      if (todayStartTask && todayStartTask.target_minutes) {
         const totalMinutes = await getTodayTotalMinutes(userId);
-        if (totalMinutes >= startTask.target_minutes) {
-          await supabase.from('schedule_tasks').update({ status: 'completed' }).eq('id', startTask.id);
-          console.log(`Start Plan達成: ${session.repmeCode} ${totalMinutes}/${startTask.target_minutes}分`);
+        if (totalMinutes >= todayStartTask.target_minutes && todayStartTask.status !== 'completed') {
+          await supabase.from('schedule_tasks').update({ status: 'completed' }).eq('id', todayStartTask.id);
+          console.log(`Start Plan達成: ${session.repmeCode} ${totalMinutes}/${todayStartTask.target_minutes}分`);
         }
       }
 
@@ -664,12 +688,12 @@ client.on('messageCreate', async (message) => {
       let replyMsg = `完了: ${minutes}分\n`;
 
       if (session.planType === 'start') {
-        const totalMinutes = await getTodayTotalMinutes(userId);
-        const target = startTask ? startTask.target_minutes : 0;
-        if (target && totalMinutes >= target) {
+        const todayTotal = await getTodayTotalMinutes(userId);
+        const target = todayStartTask ? todayStartTask.target_minutes : 0;
+        if (target && todayTotal >= target) {
           replyMsg += `目標達成済み ✅\n`;
         } else if (target) {
-          replyMsg += `目標まで残り${target - totalMinutes}分\n`;
+          replyMsg += `目標まで残り${target - todayTotal}分\n`;
         }
         replyMsg += statsLine;
       } else if (session.planType === 'schedule') {
