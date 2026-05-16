@@ -141,6 +141,29 @@ async function calcStreak(userId) {
 }
 
 // ========================================
+// 総作業日数を計算
+// ========================================
+
+async function calcTotalDays(userId) {
+  const { data: logs } = await supabase
+    .from('work_logs')
+    .select('start_time')
+    .eq('user_id', userId)
+    .not('start_time', 'is', null);
+
+  if (!logs || logs.length === 0) return 0;
+
+  const jstOffset = 9 * 60 * 60 * 1000;
+  const uniqueDays = new Set(
+    logs.map(l => {
+      const jst = new Date(new Date(l.start_time).getTime() + jstOffset);
+      return `${jst.getUTCFullYear()}-${String(jst.getUTCMonth() + 1).padStart(2, '0')}-${String(jst.getUTCDate()).padStart(2, '0')}`;
+    })
+  );
+  return uniqueDays.size;
+}
+
+// ========================================
 // Start Plan task自動生成
 // ========================================
 
@@ -427,26 +450,25 @@ client.on('messageCreate', async (message) => {
     if (planError) { console.error('!startplan insert失敗', planError); return message.reply('Start Plan登録失敗'); }
     await generateStartPlanTask(user.repme_code, userId, targetMinutes);
 
-// 当日のStart Plan taskを即時更新
-const today = getTodayJST();
-const { data: todayTask } = await supabase
-  .from('schedule_tasks')
-  .select('id, status')
-  .eq('user_id', userId)
-  .eq('plan_type', 'start')
-  .eq('task_date', today)
-  .in('status', ['planned', 'in_progress'])
-  .limit(1)
-  .single();
+    const today = getTodayJST();
+    const { data: todayTask } = await supabase
+      .from('schedule_tasks')
+      .select('id, status')
+      .eq('user_id', userId)
+      .eq('plan_type', 'start')
+      .eq('task_date', today)
+      .in('status', ['planned', 'in_progress'])
+      .limit(1)
+      .single();
 
-if (todayTask) {
-  await supabase.from('schedule_tasks')
-    .update({ target_minutes: targetMinutes, title: `今日の目標: ${targetMinutes}分` })
-    .eq('id', todayTask.id);
-  return message.reply(`目標作業時間を${targetMinutes}分に更新しました。`);
-}
+    if (todayTask) {
+      await supabase.from('schedule_tasks')
+        .update({ target_minutes: targetMinutes, title: `今日の目標: ${targetMinutes}分` })
+        .eq('id', todayTask.id);
+      return message.reply(`目標作業時間を${targetMinutes}分に更新しました。`);
+    }
 
-return message.reply(`目標作業時間: ${targetMinutes}分`);
+    return message.reply(`目標作業時間: ${targetMinutes}分`);
   }
 
   if (content.startsWith('!plan') && !content.startsWith('!plans')) {
@@ -588,13 +610,13 @@ return message.reply(`目標作業時間: ${targetMinutes}分`);
     }
 
     if (!task) {
-      sessions[userId] = { start: Date.now(), userName, repmeCode: user.repme_code, taskId: null };
+      sessions[userId] = { start: Date.now(), userName, repmeCode: user.repme_code, taskId: null, planType: null, taskEndTime: null };
       return message.reply('作業開始。終わったら !out して');
     }
 
     const { error: updateError } = await supabase.from('schedule_tasks').update({ status: 'in_progress' }).eq('id', task.id);
     if (updateError) return message.reply('task開始失敗');
-    sessions[userId] = { start: Date.now(), userName, repmeCode: user.repme_code, taskId: task.id };
+    sessions[userId] = { start: Date.now(), userName, repmeCode: user.repme_code, taskId: task.id, planType: task.plan_type, taskEndTime: task.end_time || null };
     return message.reply(`作業開始: ${task.title || '作業'}`);
   }
 
@@ -636,8 +658,36 @@ return message.reply(`目標作業時間: ${targetMinutes}分`);
       }
 
       const streak = await calcStreak(userId);
-delete sessions[userId];
-return message.reply(`完了: ${minutes}分\n連続: ${streak}日`);
+      const totalDays = await calcTotalDays(userId);
+      const statsLine = `連続: ${streak}日 参加: ${totalDays}日`;
+
+      let replyMsg = `完了: ${minutes}分\n`;
+
+      if (session.planType === 'start') {
+        const totalMinutes = await getTodayTotalMinutes(userId);
+        const target = startTask ? startTask.target_minutes : 0;
+        if (target && totalMinutes >= target) {
+          replyMsg += `目標達成済み ✅\n`;
+        } else if (target) {
+          replyMsg += `目標まで残り${target - totalMinutes}分\n`;
+        }
+        replyMsg += statsLine;
+      } else if (session.planType === 'schedule') {
+        const now = new Date();
+        const endTime = session.taskEndTime ? new Date(session.taskEndTime) : null;
+        if (endTime && now < endTime) {
+          const remainMin = Math.ceil((endTime.getTime() - now.getTime()) / 60000);
+          replyMsg += `終了まで残り${remainMin}分\n`;
+          replyMsg += statsLine;
+        } else {
+          replyMsg += statsLine + '\n次のスケジュールを提出してください。';
+        }
+      } else {
+        replyMsg += statsLine;
+      }
+
+      delete sessions[userId];
+      return message.reply(replyMsg);
     } catch (err) {
       console.error('!out 例外', err);
       delete sessions[userId];
