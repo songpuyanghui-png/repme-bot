@@ -67,6 +67,38 @@ const toJSTDate = (utcStr) => {
   return `${jst.getUTCMonth() + 1}月${jst.getUTCDate()}日`;
 };
 
+// ========================================
+// 欠席届・予定提出無し届の対象日パース
+// 「5月1日」形式 → 'YYYY-MM-DD'
+// 過去3日以内 / 当日 / 未来 → OK
+// 4日以上前 → null
+// ========================================
+
+function parseReportDate(text) {
+  const today = getTodayJST();
+  const nowJST = new Date(Date.now() + 9 * 60 * 60 * 1000);
+
+  // 「対象日：5月1日」または「5月1日」形式を抽出
+  const match = text.match(/(\d{1,2})月(\d{1,2})日/);
+  if (!match) return today; // 対象日記載なし → 当日
+
+  const month = parseInt(match[1], 10) - 1;
+  const day = parseInt(match[2], 10);
+
+  // 当年で試みる
+  let targetJST = new Date(Date.UTC(nowJST.getUTCFullYear(), month, day));
+  const todayJST = new Date(Date.UTC(nowJST.getUTCFullYear(), nowJST.getUTCMonth(), nowJST.getUTCDate()));
+  const diffDays = Math.floor((todayJST - targetJST) / (24 * 60 * 60 * 1000));
+
+  // 4日以上前はNG
+  if (diffDays > 3) return null;
+
+  const y = targetJST.getUTCFullYear();
+  const m = String(targetJST.getUTCMonth() + 1).padStart(2, '0');
+  const d = String(targetJST.getUTCDate()).padStart(2, '0');
+  return `${y}-${m}-${d}`;
+}
+
 async function getScheduledPlans(repmeCode) {
   const now = new Date();
   const { data: tasks, error } = await supabase
@@ -609,13 +641,14 @@ client.on('messageCreate', async (message) => {
       .from('users').select('repme_code').eq('user_id', userId).single();
     if (userError || !user) return message.reply('先に !link で連携して');
 
-    const today = getTodayJST();
+    const reportDate = parseReportDate(content);
+    if (!reportDate) return message.reply('対象日が古すぎます。3日以内の日付で提出してください。');
 
     const { data: existing } = await supabase
       .from('absence_reports')
       .select('id')
       .eq('repme_code', user.repme_code)
-      .eq('report_date', today)
+      .eq('report_date', reportDate)
       .eq('report_type', 'absent')
       .limit(1);
     if (existing && existing.length > 0) return message.reply('今日は欠席届を提出済みです');
@@ -623,12 +656,12 @@ client.on('messageCreate', async (message) => {
     const { error: insertError } = await supabase.from('absence_reports').insert([{
       repme_code: user.repme_code,
       user_id: userId,
-      report_date: today,
+      report_date: reportDate,
       report_type: 'absent'
     }]);
     if (insertError) { console.error('!absent insert失敗', insertError); return message.reply('欠席届の登録に失敗しました'); }
 
-    console.log(`欠席届受信: ${user.repme_code} ${today}`);
+    console.log(`欠席届受信: ${user.repme_code} ${reportDate}`);
     return message.reply('欠席届を受信しました。');
   }
 
@@ -641,13 +674,14 @@ client.on('messageCreate', async (message) => {
       .from('users').select('repme_code').eq('user_id', userId).single();
     if (userError || !user) return message.reply('先に !link で連携して');
 
-    const today = getTodayJST();
+    const reportDate = parseReportDate(content);
+    if (!reportDate) return message.reply('対象日が古すぎます。3日以内の日付で提出してください。');
 
     const { data: existing } = await supabase
       .from('absence_reports')
       .select('id')
       .eq('repme_code', user.repme_code)
-      .eq('report_date', today)
+      .eq('report_date', reportDate)
       .eq('report_type', 'no_schedule')
       .limit(1);
     if (existing && existing.length > 0) return message.reply('今日は予定提出無し届を提出済みです');
@@ -655,12 +689,12 @@ client.on('messageCreate', async (message) => {
     const { error: insertError } = await supabase.from('absence_reports').insert([{
       repme_code: user.repme_code,
       user_id: userId,
-      report_date: today,
+      report_date: reportDate,
       report_type: 'no_schedule'
     }]);
     if (insertError) { console.error('!noschedule insert失敗', insertError); return message.reply('予定提出無し届の登録に失敗しました'); }
 
-    console.log(`予定提出無し届受信: ${user.repme_code} ${today}`);
+    console.log(`予定提出無し届受信: ${user.repme_code} ${reportDate}`);
     return message.reply('予定提出無し届を受信しました。');
   }
 
