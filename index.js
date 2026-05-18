@@ -600,6 +600,70 @@ client.on('messageCreate', async (message) => {
     return message.reply('週間スケジュール登録完了');
   }
 
+  // ========================================
+  // !absent（欠席届）
+  // ========================================
+
+  if (content.startsWith('!absent')) {
+    const { data: user, error: userError } = await supabase
+      .from('users').select('repme_code').eq('user_id', userId).single();
+    if (userError || !user) return message.reply('先に !link で連携して');
+
+    const today = getTodayJST();
+
+    const { data: existing } = await supabase
+      .from('absence_reports')
+      .select('id')
+      .eq('repme_code', user.repme_code)
+      .eq('report_date', today)
+      .eq('report_type', 'absent')
+      .limit(1);
+    if (existing && existing.length > 0) return message.reply('今日は欠席届を提出済みです');
+
+    const { error: insertError } = await supabase.from('absence_reports').insert([{
+      repme_code: user.repme_code,
+      user_id: userId,
+      report_date: today,
+      report_type: 'absent'
+    }]);
+    if (insertError) { console.error('!absent insert失敗', insertError); return message.reply('欠席届の登録に失敗しました'); }
+
+    console.log(`欠席届受信: ${user.repme_code} ${today}`);
+    return message.reply('欠席届を受信しました。');
+  }
+
+  // ========================================
+  // !noschedule（予定提出無し届）
+  // ========================================
+
+  if (content.startsWith('!noschedule')) {
+    const { data: user, error: userError } = await supabase
+      .from('users').select('repme_code').eq('user_id', userId).single();
+    if (userError || !user) return message.reply('先に !link で連携して');
+
+    const today = getTodayJST();
+
+    const { data: existing } = await supabase
+      .from('absence_reports')
+      .select('id')
+      .eq('repme_code', user.repme_code)
+      .eq('report_date', today)
+      .eq('report_type', 'no_schedule')
+      .limit(1);
+    if (existing && existing.length > 0) return message.reply('今日は予定提出無し届を提出済みです');
+
+    const { error: insertError } = await supabase.from('absence_reports').insert([{
+      repme_code: user.repme_code,
+      user_id: userId,
+      report_date: today,
+      report_type: 'no_schedule'
+    }]);
+    if (insertError) { console.error('!noschedule insert失敗', insertError); return message.reply('予定提出無し届の登録に失敗しました'); }
+
+    console.log(`予定提出無し届受信: ${user.repme_code} ${today}`);
+    return message.reply('予定提出無し届を受信しました。');
+  }
+
   if (content === '!in') {
     if (sessions[userId]) return message.reply('すでに作業中');
     const { data: user, error: userError } = await supabase.from('users').select('repme_code').eq('user_id', userId).single();
@@ -607,7 +671,6 @@ client.on('messageCreate', async (message) => {
 
     const today = getTodayJST();
 
-    // Schedule Plan優先（planned限定）
     const { data: scheduleTasks, error: scheduleError } = await supabase
       .from('schedule_tasks').select('*')
       .eq('user_id', userId).eq('status', 'planned')
@@ -619,7 +682,6 @@ client.on('messageCreate', async (message) => {
     let task = scheduleTasks && scheduleTasks.length > 0 ? scheduleTasks[0] : null;
 
     if (!task) {
-      // Start Plan（planned / in_progress / completedも含めて当日taskを確認）
       const { data: startTasks, error: startError } = await supabase
         .from('schedule_tasks').select('*')
         .eq('user_id', userId)
@@ -631,14 +693,11 @@ client.on('messageCreate', async (message) => {
     }
 
     if (!task) {
-      // Free Plan
       sessions[userId] = { start: Date.now(), userName, repmeCode: user.repme_code, taskId: null, planType: null, taskEndTime: null };
       return message.reply('作業開始。終わったら !out して');
     }
 
-    // Start Planは複数回!inできる（completedでも再アタッチ）
     if (task.plan_type === 'start') {
-      // in_progress / planned なら status更新、completedはそのまま
       if (task.status === 'planned') {
         await supabase.from('schedule_tasks').update({ status: 'in_progress' }).eq('id', task.id);
       }
@@ -646,7 +705,6 @@ client.on('messageCreate', async (message) => {
       return message.reply(`作業開始: ${task.title || '今日の目標'}`);
     }
 
-    // Schedule Plan
     const { error: updateError } = await supabase.from('schedule_tasks').update({ status: 'in_progress' }).eq('id', task.id);
     if (updateError) return message.reply('task開始失敗');
     sessions[userId] = { start: Date.now(), userName, repmeCode: user.repme_code, taskId: task.id, planType: 'schedule', taskEndTime: task.end_time || null };
@@ -665,13 +723,11 @@ client.on('messageCreate', async (message) => {
       }]);
       if (logError) { console.error('!out work_logs保存失敗', logError); delete sessions[userId]; return message.reply('ログ保存失敗'); }
 
-      // Schedule Planのみtask completed更新
       if (session.taskId !== null && session.planType === 'schedule') {
         const { error: taskUpdateError } = await supabase.from('schedule_tasks').update({ status: 'completed' }).eq('id', session.taskId);
         if (taskUpdateError) { delete sessions[userId]; return message.reply('ログは保存したけどtask完了更新失敗'); }
       }
 
-      // Start Plan達成チェック（当日総作業時間で判定・status問わず取得）
       const todayStartTask = await getTodayStartTask(userId);
       if (todayStartTask && todayStartTask.target_minutes) {
         const totalMinutes = await getTodayTotalMinutes(userId);
