@@ -67,30 +67,20 @@ const toJSTDate = (utcStr) => {
   return `${jst.getUTCMonth() + 1}月${jst.getUTCDate()}日`;
 };
 
-// ========================================
-// 欠席届・予定提出無し届の対象日パース
-// 「5月1日」形式 → 'YYYY-MM-DD'
-// 過去3日以内 / 当日 / 未来 → OK
-// 4日以上前 → null
-// ========================================
-
 function parseReportDate(text) {
   const today = getTodayJST();
   const nowJST = new Date(Date.now() + 9 * 60 * 60 * 1000);
 
-  // 「対象日：5月1日」または「5月1日」形式を抽出
   const match = text.match(/(\d{1,2})月(\d{1,2})日/);
-  if (!match) return today; // 対象日記載なし → 当日
+  if (!match) return today;
 
   const month = parseInt(match[1], 10) - 1;
   const day = parseInt(match[2], 10);
 
-  // 当年で試みる
   let targetJST = new Date(Date.UTC(nowJST.getUTCFullYear(), month, day));
   const todayJST = new Date(Date.UTC(nowJST.getUTCFullYear(), nowJST.getUTCMonth(), nowJST.getUTCDate()));
   const diffDays = Math.floor((todayJST - targetJST) / (24 * 60 * 60 * 1000));
 
-  // 4日以上前はNG
   if (diffDays > 3) return null;
 
   const y = targetJST.getUTCFullYear();
@@ -386,6 +376,8 @@ async function checkStartPlanEvening() {
 
 // ========================================
 // 朝6時タスク通知
+// 追加：当日schedule_tasks(plan_type='schedule')が0件
+//       かつabsence_reportsにレコードなしのユーザーに未提出メッセージを追加
 // ========================================
 
 let lastMorningNotifyDate = null;
@@ -397,16 +389,20 @@ async function sendMorningTaskNotifications() {
   const today = getTodayJST();
   if (lastMorningNotifyDate === today) return;
   lastMorningNotifyDate = today;
+
   const { data: users, error: userError } = await supabase
     .from('users').select('repme_code, user_id');
   if (userError || !users) { console.error('朝通知 users取得失敗', userError); return; }
+
   const todayStartUTC = new Date(Date.UTC(
     parseInt(today.slice(0, 4)), parseInt(today.slice(5, 7)) - 1, parseInt(today.slice(8, 10)),
     -9, 0, 0, 0
   ));
   const todayEndUTC = new Date(todayStartUTC.getTime() + 24 * 60 * 60 * 1000 - 1);
+
   for (const user of users) {
     if (!user.user_id) continue;
+
     const { data: scheduleTasks } = await supabase
       .from('schedule_tasks')
       .select('title, scheduled_start_at, end_time, plan_type, target_minutes')
@@ -415,16 +411,20 @@ async function sendMorningTaskNotifications() {
       .gte('scheduled_start_at', todayStartUTC.toISOString())
       .lte('scheduled_start_at', todayEndUTC.toISOString())
       .order('scheduled_start_at', { ascending: true });
+
     const { data: startTasks } = await supabase
       .from('schedule_tasks')
       .select('title, target_minutes, plan_type')
       .eq('repme_code', user.repme_code)
       .eq('plan_type', 'start')
       .eq('task_date', today);
+
     const allTasks = [...(startTasks || []), ...(scheduleTasks || [])];
     if (allTasks.length === 0) continue;
+
     const nowJSTDate = new Date(Date.now() + 9 * 60 * 60 * 1000);
     const dateStr = `${nowJSTDate.getUTCFullYear()}/${String(nowJSTDate.getUTCMonth() + 1).padStart(2, '0')}/${String(nowJSTDate.getUTCDate()).padStart(2, '0')}`;
+
     const taskLines = allTasks.map(task => {
       if (task.plan_type === 'start') {
         return `・${task.title || '今日の目標'} 目標：${task.target_minutes}分（Start）`;
@@ -435,11 +435,30 @@ async function sendMorningTaskNotifications() {
         return `・${task.title || '作業'} ${timeStr}（Schedule）`;
       }
     }).join('\n');
-    const msg = `おはようございます。\n今日の予定をお知らせします。\n\n📋 ${dateStr} の作業予定\n${taskLines}\n\n今日もよろしくお願いします。`;
+
+    // スケジュール未提出チェック
+    // 条件: 当日のschedule_tasks(plan_type='schedule')が0件
+    //       かつ当日のabsence_reportsにレコードなし
+    let unsubmittedMsg = '';
+    const scheduleCount = (scheduleTasks || []).length;
+    if (scheduleCount === 0) {
+      const { data: absenceRows } = await supabase
+        .from('absence_reports')
+        .select('id')
+        .eq('repme_code', user.repme_code)
+        .eq('report_date', today)
+        .limit(1);
+      if (!absenceRows || absenceRows.length === 0) {
+        unsubmittedMsg = '\n\n本日のスケジュールが未提出です。!planで提出をお願いします。\nまた、欠席の場合は !absent スケジュールを決めない場合は !noschedule を送ってください。';
+      }
+    }
+
+    const msg = `おはようございます。\n今日の予定をお知らせします。\n\n📋 ${dateStr} の作業予定\n${taskLines}\n\n今日もよろしくお願いします。${unsubmittedMsg}`;
+
     try {
       const discordUser = await client.users.fetch(user.user_id);
       await discordUser.send(msg);
-      console.log(`朝通知送信: ${user.repme_code}`);
+      console.log(`朝通知送信: ${user.repme_code}${scheduleCount === 0 && unsubmittedMsg ? ' (未提出メッセージ追加)' : ''}`);
     } catch (err) {
       console.error(`朝通知失敗: ${user.repme_code}`, err);
     }
@@ -698,19 +717,32 @@ client.on('messageCreate', async (message) => {
     return message.reply('予定提出無し届を受信しました。');
   }
 
+  // ========================================
+  // !in
+  // バグ修正②: Schedule Planのtask再アタッチ
+  // end_timeがまだ先のtaskにアタッチされるよう修正
+  // planned / in_progress / completed を対象に、end_time > now のものを優先取得
+  // ========================================
+
   if (content === '!in') {
     if (sessions[userId]) return message.reply('すでに作業中');
     const { data: user, error: userError } = await supabase.from('users').select('repme_code').eq('user_id', userId).single();
     if (userError || !user) return message.reply('先に !link で連携して');
 
     const today = getTodayJST();
+    const now = new Date();
 
+    // Schedule Plan: end_timeがまだ先のtaskを優先（planned/in_progress/completedを対象）
     const { data: scheduleTasks, error: scheduleError } = await supabase
       .from('schedule_tasks').select('*')
-      .eq('user_id', userId).eq('status', 'planned')
-      .eq('plan_type', 'schedule').eq('task_date', today)
+      .eq('user_id', userId)
+      .in('status', ['planned', 'in_progress', 'completed'])
+      .eq('plan_type', 'schedule')
+      .eq('task_date', today)
       .not('scheduled_start_at', 'is', null)
-      .order('scheduled_start_at', { ascending: true }).limit(1);
+      .gt('end_time', now.toISOString())
+      .order('scheduled_start_at', { ascending: true })
+      .limit(1);
     if (scheduleError) return message.reply('task取得失敗');
 
     let task = scheduleTasks && scheduleTasks.length > 0 ? scheduleTasks[0] : null;
@@ -739,11 +771,21 @@ client.on('messageCreate', async (message) => {
       return message.reply(`作業開始: ${task.title || '今日の目標'}`);
     }
 
-    const { error: updateError } = await supabase.from('schedule_tasks').update({ status: 'in_progress' }).eq('id', task.id);
-    if (updateError) return message.reply('task開始失敗');
+    if (task.status === 'planned') {
+      const { error: updateError } = await supabase.from('schedule_tasks').update({ status: 'in_progress' }).eq('id', task.id);
+      if (updateError) return message.reply('task開始失敗');
+    }
+
     sessions[userId] = { start: Date.now(), userName, repmeCode: user.repme_code, taskId: task.id, planType: 'schedule', taskEndTime: task.end_time || null };
     return message.reply(`作業開始: ${task.title || '作業'}`);
   }
+
+  // ========================================
+  // !out
+  // バグ修正①: Schedule Plan表示
+  // - end_timeはsession.taskEndTimeのみ参照（次taskは見ない）
+  // - end_time過ぎ or なし → 当日plannedのschedule taskが残ってるか確認して文言分岐
+  // ========================================
 
   if (content === '!out') {
     const session = sessions[userId];
@@ -762,6 +804,7 @@ client.on('messageCreate', async (message) => {
         if (taskUpdateError) { delete sessions[userId]; return message.reply('ログは保存したけどtask完了更新失敗'); }
       }
 
+      // Start Plan達成判定（表示はしないがDB更新は継続）
       const todayStartTask = await getTodayStartTask(userId);
       if (todayStartTask && todayStartTask.target_minutes) {
         const totalMinutes = await getTodayTotalMinutes(userId);
@@ -771,37 +814,8 @@ client.on('messageCreate', async (message) => {
         }
       }
 
-      const streak = await calcStreak(userId);
-      const totalDays = await calcTotalDays(userId);
-      const statsLine = `連続: ${streak}日 参加: ${totalDays}日`;
-
-      let replyMsg = `完了: ${minutes}分\n`;
-
-      if (session.planType === 'start') {
-        const todayTotal = await getTodayTotalMinutes(userId);
-        const target = todayStartTask ? todayStartTask.target_minutes : 0;
-        if (target && todayTotal >= target) {
-          replyMsg += `目標達成済み ✅\n`;
-        } else if (target) {
-          replyMsg += `目標まで残り${target - todayTotal}分\n`;
-        }
-        replyMsg += statsLine;
-      } else if (session.planType === 'schedule') {
-        const now = new Date();
-        const endTime = session.taskEndTime ? new Date(session.taskEndTime) : null;
-        if (endTime && now < endTime) {
-          const remainMin = Math.ceil((endTime.getTime() - now.getTime()) / 60000);
-          replyMsg += `終了まで残り${remainMin}分\n`;
-          replyMsg += statsLine;
-        } else {
-          replyMsg += statsLine + '\n次のスケジュールを提出してください。';
-        }
-      } else {
-        replyMsg += statsLine;
-      }
-
       delete sessions[userId];
-      return message.reply(replyMsg);
+      return message.reply(`完了: ${minutes}分`);
     } catch (err) {
       console.error('!out 例外', err);
       delete sessions[userId];
