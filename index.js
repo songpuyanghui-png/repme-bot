@@ -438,18 +438,32 @@ async function sendMorningTaskNotifications() {
 
     // スケジュール未提出チェック
     // 条件: 当日のschedule_tasks(plan_type='schedule')が0件
+    //       かつ直近7日間にschedule taskが1件もない（Start Planのみユーザーは除外）
     //       かつ当日のabsence_reportsにレコードなし
     let unsubmittedMsg = '';
     const scheduleCount = (scheduleTasks || []).length;
     if (scheduleCount === 0) {
-      const { data: absenceRows } = await supabase
-        .from('absence_reports')
+      // 直近7日間のschedule taskチェック
+      const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
+      const { data: recentScheduleTasks } = await supabase
+        .from('schedule_tasks')
         .select('id')
         .eq('repme_code', user.repme_code)
-        .eq('report_date', today)
+        .eq('plan_type', 'schedule')
+        .gte('task_date', sevenDaysAgo.slice(0, 10))
         .limit(1);
-      if (!absenceRows || absenceRows.length === 0) {
-        unsubmittedMsg = '\n\n本日のスケジュールが未提出です。!planで提出をお願いします。\nまた、欠席の場合は !absent スケジュールを決めない場合は !noschedule を送ってください。';
+
+      if (recentScheduleTasks && recentScheduleTasks.length > 0) {
+        // 直近7日にschedule taskあり → 未提出チェック対象
+        const { data: absenceRows } = await supabase
+          .from('absence_reports')
+          .select('id')
+          .eq('repme_code', user.repme_code)
+          .eq('report_date', today)
+          .limit(1);
+        if (!absenceRows || absenceRows.length === 0) {
+          unsubmittedMsg = '\n\n本日のスケジュールが未提出です。!planで提出をお願いします。\nまた、欠席の場合は !absent スケジュールを決めない場合は !noschedule を送ってください。';
+        }
       }
     }
 
