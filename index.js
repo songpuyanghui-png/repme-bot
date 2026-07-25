@@ -376,8 +376,6 @@ async function checkStartPlanEvening() {
 
 // ========================================
 // 朝6時タスク通知
-// 追加：当日schedule_tasks(plan_type='schedule')が0件
-//       かつabsence_reportsにレコードなしのユーザーに未提出メッセージを追加
 // ========================================
 
 let lastMorningNotifyDate = null;
@@ -436,43 +434,12 @@ async function sendMorningTaskNotifications() {
       }
     }).join('\n');
 
-    // スケジュール未提出チェック
-    // 条件: 当日のschedule_tasks(plan_type='schedule')が0件
-    //       かつ直近7日間にschedule taskが1件もない（Start Planのみユーザーは除外）
-    //       かつ当日のabsence_reportsにレコードなし
-    let unsubmittedMsg = '';
-    const scheduleCount = (scheduleTasks || []).length;
-    if (scheduleCount === 0) {
-      // 直近7日間のschedule taskチェック
-      const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
-      const { data: recentScheduleTasks } = await supabase
-        .from('schedule_tasks')
-        .select('id')
-        .eq('repme_code', user.repme_code)
-        .eq('plan_type', 'schedule')
-        .gte('task_date', sevenDaysAgo.slice(0, 10))
-        .limit(1);
-
-      if (recentScheduleTasks && recentScheduleTasks.length > 0) {
-        // 直近7日にschedule taskあり → 未提出チェック対象
-        const { data: absenceRows } = await supabase
-          .from('absence_reports')
-          .select('id')
-          .eq('repme_code', user.repme_code)
-          .eq('report_date', today)
-          .limit(1);
-        if (!absenceRows || absenceRows.length === 0) {
-          unsubmittedMsg = '\n\n本日のスケジュールが未提出です。!planで提出をお願いします。\nまた、欠席の場合は !absent スケジュールを決めない場合は !noschedule を送ってください。';
-        }
-      }
-    }
-
-    const msg = `おはようございます。\n今日の予定をお知らせします。\n\n📋 ${dateStr} の作業予定\n${taskLines}\n\n今日もよろしくお願いします。${unsubmittedMsg}`;
+    const msg = `おはようございます。\n今日の予定をお知らせします。\n\n📋 ${dateStr} の作業予定\n${taskLines}\n\n今日もよろしくお願いします。`;
 
     try {
       const discordUser = await client.users.fetch(user.user_id);
       await discordUser.send(msg);
-      console.log(`朝通知送信: ${user.repme_code}${scheduleCount === 0 && unsubmittedMsg ? ' (未提出メッセージ追加)' : ''}`);
+      console.log(`朝通知送信: ${user.repme_code}`);
     } catch (err) {
       console.error(`朝通知失敗: ${user.repme_code}`, err);
     }
@@ -696,39 +663,6 @@ client.on('messageCreate', async (message) => {
 
     console.log(`欠席届受信: ${user.repme_code} ${reportDate}`);
     return message.reply('欠席届を受信しました。');
-  }
-
-  // ========================================
-  // !noschedule（予定提出無し届）
-  // ========================================
-
-  if (content.startsWith('!noschedule')) {
-    const { data: user, error: userError } = await supabase
-      .from('users').select('repme_code').eq('user_id', userId).single();
-    if (userError || !user) return message.reply('先に !link で連携して');
-
-    const reportDate = parseReportDate(content);
-    if (!reportDate) return message.reply('対象日が古すぎます。3日以内の日付で提出してください。');
-
-    const { data: existing } = await supabase
-      .from('absence_reports')
-      .select('id')
-      .eq('repme_code', user.repme_code)
-      .eq('report_date', reportDate)
-      .eq('report_type', 'no_schedule')
-      .limit(1);
-    if (existing && existing.length > 0) return message.reply('今日は予定提出無し届を提出済みです');
-
-    const { error: insertError } = await supabase.from('absence_reports').insert([{
-      repme_code: user.repme_code,
-      user_id: userId,
-      report_date: reportDate,
-      report_type: 'no_schedule'
-    }]);
-    if (insertError) { console.error('!noschedule insert失敗', insertError); return message.reply('予定提出無し届の登録に失敗しました'); }
-
-    console.log(`予定提出無し届受信: ${user.repme_code} ${reportDate}`);
-    return message.reply('予定提出無し届を受信しました。');
   }
 
   // ========================================
