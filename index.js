@@ -1,13 +1,16 @@
 require('dotenv').config();
-const { Client, GatewayIntentBits } = require('discord.js');
+const { Client, GatewayIntentBits, Partials, ChannelType } = require('discord.js');
 const { createClient } = require('@supabase/supabase-js');
 
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
     GatewayIntentBits.GuildMessages,
-    GatewayIntentBits.MessageContent
-  ]
+    GatewayIntentBits.GuildMembers,
+    GatewayIntentBits.MessageContent,
+    GatewayIntentBits.DirectMessages,
+  ],
+  partials: [Partials.Channel],
 });
 
 const supabase = createClient(
@@ -17,8 +20,406 @@ const supabase = createClient(
 
 const sessions = {};
 const unplanSessions = {};
+/** 入室チュートリアル（実験） userId → { step, repmeCode?, expiresAt } */
+const tutorialSessions = {};
 
 const notifyingTaskIds = new Set();
+
+// ========================================
+// 入室チュートリアル（実験版）
+// DMで進行 / サーバーで !in !out !link を実践
+// ========================================
+
+const TUTORIAL_TTL_MS = 24 * 60 * 60 * 1000;
+
+const TUTORIAL_MSG = {
+  // 各値は連続送信する通の配列（コピー用は 本文 / コマンド / （⇧コピー用））
+  welcome: [
+    [
+      'REPME Focus Gymへようこそ！',
+      'まずは1分で終わるチュートリアルとユーザー登録を行いましょう！',
+      '準備ができたらOKと送ってください',
+    ].join('\n'),
+    'OK',
+    '（⇧コピー用）',
+  ],
+  practiceIn: [
+    [
+      'まずは、作業開始を記録する 「!in」 をやってみましょう！',
+      'サーバーの「出勤・退勤｜check-in」 チャンネルで',
+      '!in と送信してください。',
+    ].join('\n'),
+    '!in',
+    '（⇧コピー用）',
+  ],
+  practiceOut: [
+    [
+      '完璧です！',
+      '!in を確認しました。',
+      '!in は「これから作業を開始する」という合図になります。',
+      '次は終了時の !out を試してみましょう',
+    ].join('\n'),
+    '!out',
+    '（⇧コピー用）',
+  ],
+  awaitLink: [
+    [
+      '完璧です！',
+      '!out を確認しました。',
+      '!out は「作業を終了する」という合図になります。',
+      '今日からは、作業前に「!in」、作業後に「!out」を習慣にしていきましょう！',
+      'これでチュートリアルは完了です',
+      '最後にユーザー登録を行いましょう',
+      '「ユーザー登録」 チャンネルで',
+      '!link と送ってください。',
+    ].join('\n'),
+    '!link',
+    '（⇧コピー用）',
+  ],
+  credentials: (code, password) => [
+    [
+      '完璧です！',
+      '!link を確認しました。',
+      `あなたのREPMEコードは${code}`,
+      `パスワードは${password}です。`,
+      'このコード、パスワードを使って',
+      '下記のリンクからあなたの作業時間の記録を確認できます！',
+      'https://repme-web.vercel.app',
+      '',
+      'これで全ての準備が整いました！',
+      'ここまで理解できましたらOKと送ってください',
+    ].join('\n'),
+    'OK',
+    '（⇧コピー用）',
+  ],
+  closing: [
+    [
+      'チュートリアルとREPME登録を完了しました！',
+      '「必ずお読みください」 チャンネルで、REPMEサーバーの詳しい説明をまとめましたので、お時間のある際にお読みください。',
+      'それでは、今日から一緒に集中する習慣を積み重ねていきましょう！',
+    ].join('\n'),
+  ],
+};
+
+function isTutorialExpired(session) {
+  return !session || Date.now() > (session.expiresAt || 0);
+}
+
+function isOkText(text) {
+  return /^(ok|ＯＫ|Okay)$/i.test(String(text || '').trim());
+}
+
+async function allocateRepmeCode() {
+  const { data, error } = await supabase.from('users').select('repme_code');
+  if (error) {
+    console.error('allocateRepmeCode', error);
+    throw error;
+  }
+  let max = 0;
+  for (const row of data || []) {
+    const m = String(row.repme_code || '').match(/^(?:REPME)?(\d+)$/i);
+    if (m) max = Math.max(max, parseInt(m[1], 10));
+  }
+  // 既存 001 / REPME001 など数値部分の最大+1 → REPME002, REPME003...
+  return `REPME${String(max + 1).padStart(3, '0')}`;
+}
+
+/** 新規コードで insert。競合したら採番し直して最大5回リトライ */
+async function insertUserWithNewCode(discordUser, password) {
+  const userId = discordUser.id;
+  const userName = discordUser.username;
+  let lastError = null;
+  for (let attempt = 0; attempt < 5; attempt++) {
+    const code = await allocateRepmeCode();
+    const { error } = await supabase.from('users').insert([{
+      repme_code: code,
+      user_id: userId,
+      password,
+      display_name: userName,
+    }]);
+    if (!error) return code;
+    lastError = error;
+    // unique 競合以外は即失敗
+    const msg = String(error.message || error.code || '');
+    if (!/duplicate|unique|23505/i.test(msg)) throw error;
+  }
+  throw lastError || new Error('repme_code 発行に失敗しました');
+}
+
+function generateReadablePassword() {
+  const chars = 'abcdefghjkmnpqrstuvwxyz23456789';
+  let s = '';
+  for (let i = 0; i < 8; i++) s += chars[Math.floor(Math.random() * chars.length)];
+  return s;
+}
+
+function randomTempPassword() {
+  return `tmp_${Math.random().toString(36).slice(2, 10)}${Date.now().toString(36).slice(-4)}`;
+}
+
+async function dmUser(userOrId, text) {
+  try {
+    const user =
+      typeof userOrId === 'string' ? await client.users.fetch(userOrId) : userOrId;
+    await user.send(text);
+    return true;
+  } catch (err) {
+    console.error('チュートリアルDM失敗', err?.message || err);
+    return false;
+  }
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/** チュートリアル案内を複数通に分けて連続送信 */
+async function dmSequence(userOrId, parts) {
+  const list = Array.isArray(parts) ? parts : [parts];
+  let ok = true;
+  for (let i = 0; i < list.length; i++) {
+    const sent = await dmUser(userOrId, list[i]);
+    if (!sent) ok = false;
+    if (i < list.length - 1) await sleep(300);
+  }
+  return ok;
+}
+
+/** !in 用に仮ユーザーを用意（パスワードは !link で正式発行） */
+async function ensureTutorialUser(discordUser) {
+  const userId = discordUser.id;
+  const { data: existing } = await supabase
+    .from('users')
+    .select('repme_code')
+    .eq('user_id', userId)
+    .maybeSingle();
+  if (existing?.repme_code) return existing.repme_code;
+  return insertUserWithNewCode(discordUser, randomTempPassword());
+}
+
+function touchTutorial(session) {
+  session.expiresAt = Date.now() + TUTORIAL_TTL_MS;
+  return session;
+}
+
+async function beginTutorial(discordUser, { force = false } = {}) {
+  const userId = discordUser.id;
+
+  if (!force) {
+    const { data: existing } = await supabase
+      .from('users')
+      .select('repme_code')
+      .eq('user_id', userId)
+      .maybeSingle();
+    if (existing?.repme_code) {
+      await dmUser(
+        discordUser,
+        `すでに連携済みです（コード: ${existing.repme_code}）。\nやり直しは \`!tutorial\` と送ってください。`,
+      );
+      return;
+    }
+  }
+
+  tutorialSessions[userId] = {
+    step: 'await_ok_start',
+    expiresAt: Date.now() + TUTORIAL_TTL_MS,
+  };
+
+  const ok = await dmSequence(discordUser, TUTORIAL_MSG.welcome);
+  if (!ok) {
+    delete tutorialSessions[userId];
+    console.warn(`チュートリアル開始失敗（DM不可）: ${userId}`);
+  } else {
+    console.log(`チュートリアル開始: ${userId}`);
+  }
+}
+
+async function handleTutorialOkStart(message) {
+  const userId = message.author.id;
+  let code;
+  try {
+    code = await ensureTutorialUser(message.author);
+  } catch (err) {
+    console.error('チュートリアル仮登録失敗', err);
+    await message.reply('準備に失敗しました。少ししてからもう一度 OK を送ってください。');
+    return;
+  }
+
+  tutorialSessions[userId] = touchTutorial({
+    step: 'practice_in',
+    repmeCode: code,
+  });
+  await dmSequence(message.author, TUTORIAL_MSG.practiceIn);
+}
+
+async function finalizeTutorialLink(discordUser, { existingCode = null } = {}) {
+  const userId = discordUser.id;
+  const userName = discordUser.username;
+  let code = existingCode;
+
+  if (!code) {
+    const { data: existing } = await supabase
+      .from('users')
+      .select('repme_code')
+      .eq('user_id', userId)
+      .maybeSingle();
+    code = existing?.repme_code || null;
+  }
+
+  const password = generateReadablePassword();
+
+  if (!code) {
+    code = await insertUserWithNewCode(discordUser, password);
+    return { code, password };
+  }
+
+  const { error } = await supabase
+    .from('users')
+    .update({
+      user_id: userId,
+      password,
+      display_name: userName,
+    })
+    .eq('repme_code', code);
+  if (error) throw error;
+  return { code, password };
+}
+
+async function advanceTutorialOnGuildAction(userId, action) {
+  const session = tutorialSessions[userId];
+  if (!session || isTutorialExpired(session)) {
+    if (session) delete tutorialSessions[userId];
+    return;
+  }
+
+  if (action === 'in' && session.step === 'practice_in') {
+    session.step = 'practice_out';
+    touchTutorial(session);
+    await dmSequence(userId, TUTORIAL_MSG.practiceOut);
+    return;
+  }
+
+  if (action === 'out' && session.step === 'practice_out') {
+    session.step = 'await_link';
+    touchTutorial(session);
+    await dmSequence(userId, TUTORIAL_MSG.awaitLink);
+  }
+}
+
+async function advanceTutorialOnLink(userId, code, password) {
+  const session = tutorialSessions[userId];
+  if (!session || isTutorialExpired(session)) {
+    if (session) delete tutorialSessions[userId];
+    return false;
+  }
+  if (session.step !== 'await_link') return false;
+
+  session.step = 'await_ok_end';
+  session.repmeCode = code;
+  session.password = password;
+  touchTutorial(session);
+  await dmSequence(userId, TUTORIAL_MSG.credentials(code, password));
+  return true;
+}
+
+function tutorialStatusText(userId) {
+  const session = tutorialSessions[userId];
+  if (!session || isTutorialExpired(session)) {
+    return 'チュートリアル進行中ではありません。\nいつでも `!tutorial` で開始／やり直しできます。';
+  }
+  const stepLabel = {
+    await_ok_start: '① DMで OK',
+    practice_in: '② サーバーで !in',
+    practice_out: '③ サーバーで !out',
+    await_link: '④ ユーザー登録チャンネルで !link',
+    await_ok_end: '⑤ DMで OK（説明の確認）',
+  }[session.step] || session.step;
+  const codeLine = session.repmeCode ? `\nコード: ${session.repmeCode}` : '';
+  return `いまのステップ: ${stepLabel}${codeLine}\n\nやり直し: \`!tutorial\`\n状態確認: \`!tutorial status\``;
+}
+
+async function handleTutorialCommand(message) {
+  const parts = message.content.trim().split(/\s+/);
+  const sub = (parts[1] || '').toLowerCase();
+
+  if (sub === 'status' || sub === '状態') {
+    await message.reply(tutorialStatusText(message.author.id));
+    return true;
+  }
+
+  if (sub === 'help' || sub === 'ヘルプ') {
+    await message.reply(
+      [
+        '【チュートリアルコマンド】',
+        '`!tutorial` … いつでも開始／最初からやり直し',
+        '`!tutorial status` … いまの進行状況',
+        '`!tutorial help` … この説明',
+        '',
+        '流れ: OK → !in → !out → !link → OK',
+      ].join('\n'),
+    );
+    return true;
+  }
+
+  await beginTutorial(message.author, { force: true });
+  if (message.guild) {
+    await message.reply('DMに案内を送りました。届かないときは「サーバーメンバーからのDM」を許可してください。');
+  }
+  return true;
+}
+
+async function handleTutorialDM(message) {
+  const userId = message.author.id;
+  const content = message.content.trim();
+
+  if (content === '!tutorial' || content.startsWith('!tutorial ')) {
+    await handleTutorialCommand(message);
+    return true;
+  }
+
+  const session = tutorialSessions[userId];
+  if (!session || isTutorialExpired(session)) {
+    if (session) delete tutorialSessions[userId];
+    return false;
+  }
+
+  if (session.step === 'await_ok_start') {
+    if (!isOkText(content)) {
+      await message.reply('準備ができたら「OK」と送ってください。');
+      return true;
+    }
+    await handleTutorialOkStart(message);
+    return true;
+  }
+
+  if (session.step === 'await_ok_end') {
+    if (!isOkText(content)) {
+      await message.reply('内容を確認できたら「OK」と送ってください。');
+      return true;
+    }
+    delete tutorialSessions[userId];
+    await dmSequence(message.author, TUTORIAL_MSG.closing);
+    console.log(`チュートリアル完了: ${userId}`);
+    return true;
+  }
+
+  if (session.step === 'practice_in') {
+    await message.reply('いまはサーバーの「出勤・退勤｜check-in」チャンネルで `!in` を送る番です。\n状況: `!tutorial status`');
+    return true;
+  }
+
+  if (session.step === 'practice_out') {
+    await message.reply('いまはサーバーで `!out` を送る番です。\n状況: `!tutorial status`');
+    return true;
+  }
+
+  if (session.step === 'await_link') {
+    await message.reply('いまは「ユーザー登録」チャンネルで `!link` を送る番です。\n状況: `!tutorial status`');
+    return true;
+  }
+
+  return false;
+}
 
 // ========================================
 // ユーティリティ
@@ -466,6 +867,13 @@ client.once('ready', async () => {
   startIntervals();
 });
 
+// 入室 → DMチュートリアル開始（実験）
+client.on('guildMemberAdd', async (member) => {
+  if (member.user.bot) return;
+  console.log(`入室検知: ${member.user.tag} (${member.id})`);
+  await beginTutorial(member.user);
+});
+
 // ========================================
 // メッセージ処理
 // ========================================
@@ -477,12 +885,52 @@ client.on('messageCreate', async (message) => {
   const userName = message.author.username;
   const dayMap = { '月': 'mon', '火': 'tue', '水': 'wed', '木': 'thu', '金': 'fri', '土': 'sat', '日': 'sun' };
 
-  if (content.startsWith('!link')) {
-    const code = content.split(/\s+/)[1];
-    if (!code) return message.reply('使い方: !link REPME_CODE');
-    const { error } = await supabase.from('users').upsert({ repme_code: code, user_id: userId }, { onConflict: 'repme_code' });
-    if (error) { console.error('!link失敗', error); return message.reply('連携失敗'); }
-    return message.reply(`連携完了: ${code}`);
+  // DM: チュートリアル進行
+  if (!message.guild || message.channel?.type === ChannelType.DM) {
+    const handled = await handleTutorialDM(message);
+    if (handled) return;
+    return;
+  }
+
+  if (content === '!tutorial' || content.startsWith('!tutorial ')) {
+    await handleTutorialCommand(message);
+    return;
+  }
+
+  // !link … 引数なしで自動発行 / !link CODE で既存コード連携
+  if (content === '!link' || content.startsWith('!link ')) {
+    const arg = content.split(/\s+/)[1];
+    const tut = tutorialSessions[userId];
+    const inTutorialLink = tut && !isTutorialExpired(tut) && tut.step === 'await_link';
+
+    if (!arg || inTutorialLink) {
+      try {
+        const existingCode = inTutorialLink ? tut.repmeCode : null;
+        const { code, password } = await finalizeTutorialLink(message.author, { existingCode });
+        if (inTutorialLink) {
+          await advanceTutorialOnLink(userId, code, password);
+          await message.reply(`登録完了: ${code}\nパスワードはDMに送りました。確認してください。`);
+        } else {
+          await message.reply(
+            `登録完了\nREPMEコード: ${code}\nパスワード: ${password}\n記録確認: https://repme-web.vercel.app`,
+          );
+        }
+        console.log(`!link 自動登録: ${code} / ${userId}`);
+      } catch (err) {
+        console.error('!link 自動登録失敗', err);
+        await message.reply('登録に失敗しました。もう一度 !link を送ってください。');
+      }
+      return;
+    }
+
+    const { error } = await supabase
+      .from('users')
+      .upsert({ repme_code: arg, user_id: userId }, { onConflict: 'repme_code' });
+    if (error) {
+      console.error('!link失敗', error);
+      return message.reply('連携失敗');
+    }
+    return message.reply(`連携完了: ${arg}`);
   }
 
   if (content.startsWith('!startplan')) {
@@ -708,7 +1156,9 @@ client.on('messageCreate', async (message) => {
 
     if (!task) {
       sessions[userId] = { start: Date.now(), userName, repmeCode: user.repme_code, taskId: null, planType: null, taskEndTime: null };
-      return message.reply('作業開始。終わったら !out して');
+      await message.reply('作業開始。終わったら !out して');
+      await advanceTutorialOnGuildAction(userId, 'in');
+      return;
     }
 
     if (task.plan_type === 'start') {
@@ -716,7 +1166,9 @@ client.on('messageCreate', async (message) => {
         await supabase.from('schedule_tasks').update({ status: 'in_progress' }).eq('id', task.id);
       }
       sessions[userId] = { start: Date.now(), userName, repmeCode: user.repme_code, taskId: task.id, planType: 'start', taskEndTime: null };
-      return message.reply(`作業開始: ${task.title || '今日の目標'}`);
+      await message.reply(`作業開始: ${task.title || '今日の目標'}`);
+      await advanceTutorialOnGuildAction(userId, 'in');
+      return;
     }
 
     if (task.status === 'planned') {
@@ -725,7 +1177,9 @@ client.on('messageCreate', async (message) => {
     }
 
     sessions[userId] = { start: Date.now(), userName, repmeCode: user.repme_code, taskId: task.id, planType: 'schedule', taskEndTime: task.end_time || null };
-    return message.reply(`作業開始: ${task.title || '作業'}`);
+    await message.reply(`作業開始: ${task.title || '作業'}`);
+    await advanceTutorialOnGuildAction(userId, 'in');
+    return;
   }
 
   // ========================================
@@ -763,7 +1217,9 @@ client.on('messageCreate', async (message) => {
       }
 
       delete sessions[userId];
-      return message.reply(`完了: ${minutes}分`);
+      await message.reply(`完了: ${minutes}分`);
+      await advanceTutorialOnGuildAction(userId, 'out');
+      return;
     } catch (err) {
       console.error('!out 例外', err);
       delete sessions[userId];
