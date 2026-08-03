@@ -22,6 +22,9 @@ const sessions = {};
 const unplanSessions = {};
 /** 入室チュートリアル（実験） userId → { step, repmeCode?, expiresAt } */
 const tutorialSessions = {};
+/** !confirm 連打防止 userId → lastUsedAt */
+const confirmCooldown = {};
+const CONFIRM_COOLDOWN_MS = 5 * 60 * 1000;
 
 const notifyingTaskIds = new Set();
 
@@ -923,14 +926,103 @@ client.on('messageCreate', async (message) => {
       return;
     }
 
+    // 001 → REPME001 を優先（短い 001 行と正規 REPMEXXX が両方あることが多い）
+    const resolveExistingLinkCode = async (raw) => {
+      const input = String(raw || '').trim();
+      if (!input) return null;
+      if (/^\d+$/.test(input)) {
+        const padded = input.padStart(3, '0');
+        for (const c of [`REPME${padded}`, `REPME${input}`]) {
+          const { data } = await supabase
+            .from('users').select('repme_code').eq('repme_code', c).maybeSingle();
+          if (data?.repme_code) return data.repme_code;
+        }
+      }
+      const m = /^REPME(\d+)$/i.exec(input);
+      if (m) {
+        const padded = m[1].padStart(3, '0');
+        const canonical = `REPME${padded}`;
+        const { data } = await supabase
+          .from('users').select('repme_code').eq('repme_code', canonical).maybeSingle();
+        if (data?.repme_code) return data.repme_code;
+      }
+      const { data: exact } = await supabase
+        .from('users').select('repme_code').eq('repme_code', input).maybeSingle();
+      if (exact?.repme_code) return exact.repme_code;
+      return input;
+    };
+
+    const linkCode = await resolveExistingLinkCode(arg);
+    // 数字だけ指定で REPME001 が取れた場合、短い 001 行ではなく正規コードへ紐づける
     const { error } = await supabase
       .from('users')
-      .upsert({ repme_code: arg, user_id: userId }, { onConflict: 'repme_code' });
+      .upsert({ repme_code: linkCode, user_id: userId }, { onConflict: 'repme_code' });
     if (error) {
       console.error('!link失敗', error);
       return message.reply('連携失敗');
     }
-    return message.reply(`連携完了: ${arg}`);
+    const note = linkCode !== arg ? `（${arg} → ${linkCode}）` : '';
+    return message.reply(`連携完了: ${linkCode}${note}`);
+  }
+
+  // !confirm / !recover … 連携済みユーザーへコード＋新しい一時パスワードをDM
+  if (content === '!confirm' || content === '!recover') {
+    const last = confirmCooldown[userId] || 0;
+    if (Date.now() - last < CONFIRM_COOLDOWN_MS) {
+      const waitMin = Math.ceil((CONFIRM_COOLDOWN_MS - (Date.now() - last)) / 60000);
+      return message.reply(`連続利用を防ぐため、約${waitMin}分あとに再度お試しください。`);
+    }
+
+    const { data: rows, error: findError } = await supabase
+      .from('users')
+      .select('repme_code, user_id')
+      .eq('user_id', userId);
+    if (findError) {
+      console.error('!confirm 検索失敗', findError);
+      return message.reply('確認中にエラーが起きました。しばらくして再度お試しください。');
+    }
+    if (!rows || rows.length === 0) {
+      return message.reply(
+        'まだDiscord連携されていません。\n先に `!link` または `!link REPMEコード` を送ってください。',
+      );
+    }
+
+    const preferred = [...rows].sort((a, b) => {
+      const aRepme = /^REPME\d+$/i.test(a.repme_code) ? 1 : 0;
+      const bRepme = /^REPME\d+$/i.test(b.repme_code) ? 1 : 0;
+      return bRepme - aRepme;
+    })[0];
+    const code = preferred.repme_code;
+    const newPassword = generateReadablePassword();
+
+    const { error: updateError } = await supabase
+      .from('users')
+      .update({ password: newPassword })
+      .eq('user_id', userId);
+    if (updateError) {
+      console.error('!confirm パスワード更新失敗', updateError);
+      return message.reply('パスワードの再発行に失敗しました。しばらくして再度お試しください。');
+    }
+
+    confirmCooldown[userId] = Date.now();
+    const dmOk = await dmUser(
+      message.author,
+      [
+        '【REPME ログイン情報】',
+        `REPMEコード: ${code}`,
+        `新しいパスワード: ${newPassword}`,
+        '',
+        'アプリのログイン画面で上記を入力してください。',
+        '以前のパスワードは使えなくなっています。',
+      ].join('\n'),
+    );
+
+    if (dmOk) {
+      return message.reply('DMにREPMEコードと新しいパスワードを送りました。確認してください。');
+    }
+    return message.reply(
+      'DMを送れませんでした。\nDiscordの「サーバーメンバーからのダイレクトメッセージ」を許可してから、もう一度 `!confirm` を送ってください。',
+    );
   }
 
   if (content.startsWith('!startplan')) {
