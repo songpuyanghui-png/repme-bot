@@ -18,6 +18,22 @@ const supabase = createClient(
   process.env.SUPABASE_ANON_KEY || process.env.SUPABASE_KEY
 );
 
+/** Discord ID → users 行（001 / REPME001 重複時は REPMEXXX を優先） */
+async function findUserByDiscordId(userId) {
+  const { data: rows, error } = await supabase
+    .from('users')
+    .select('repme_code, user_id')
+    .eq('user_id', userId);
+  if (error) return { user: null, error };
+  if (!rows || rows.length === 0) return { user: null, error: null };
+  const preferred = [...rows].sort((a, b) => {
+    const aRepme = /^REPME\d+$/i.test(a.repme_code) ? 1 : 0;
+    const bRepme = /^REPME\d+$/i.test(b.repme_code) ? 1 : 0;
+    return bRepme - aRepme;
+  })[0];
+  return { user: preferred, error: null };
+}
+
 const sessions = {};
 const unplanSessions = {};
 /** 入室チュートリアル（実験） userId → { step, repmeCode?, expiresAt } */
@@ -191,11 +207,7 @@ async function dmSequence(userOrId, parts) {
 /** !in 用に仮ユーザーを用意（パスワードは !link で正式発行） */
 async function ensureTutorialUser(discordUser) {
   const userId = discordUser.id;
-  const { data: existing } = await supabase
-    .from('users')
-    .select('repme_code')
-    .eq('user_id', userId)
-    .maybeSingle();
+  const { user: existing } = await findUserByDiscordId(userId);
   if (existing?.repme_code) return existing.repme_code;
   return insertUserWithNewCode(discordUser, randomTempPassword());
 }
@@ -209,11 +221,7 @@ async function beginTutorial(discordUser, { force = false } = {}) {
   const userId = discordUser.id;
 
   if (!force) {
-    const { data: existing } = await supabase
-      .from('users')
-      .select('repme_code')
-      .eq('user_id', userId)
-      .maybeSingle();
+    const { user: existing } = await findUserByDiscordId(userId);
     if (existing?.repme_code) {
       await dmUser(
         discordUser,
@@ -1030,7 +1038,7 @@ client.on('messageCreate', async (message) => {
     if (!parts[1]) return message.reply('使い方: !startplan 60');
     const targetMinutes = parseInt(parts[1], 10);
     if (isNaN(targetMinutes) || targetMinutes <= 0) return message.reply('分数は1以上の整数で入力して');
-    const { data: user, error: userError } = await supabase.from('users').select('repme_code').eq('user_id', userId).single();
+    const { data: user, error: userError } = await findUserByDiscordId(userId);
     if (userError || !user) return message.reply('先に !link で連携して');
     const { error: planError } = await supabase.from('plans').insert([{
       user_id: userId, repme_code: user.repme_code, plan_type: 'start', target_minutes: targetMinutes
@@ -1062,7 +1070,7 @@ client.on('messageCreate', async (message) => {
   if (content.startsWith('!plan') && !content.startsWith('!plans')) {
     const parts = content.split(/\s+/);
     if (parts.length < 2) return message.reply('使い方: !plan 14:00 タイトル / !plan 4/17 14:00 タイトル');
-    const { data: user, error: userError } = await supabase.from('users').select('repme_code').eq('user_id', userId).single();
+    const { data: user, error: userError } = await findUserByDiscordId(userId);
     if (userError || !user) return message.reply('先に !link で連携して');
     const isTimeStr = (s) => /^\d{1,2}:\d{2}$/.test(s);
     const isDateStr = (s) => /^\d{1,2}\/\d{1,2}$/.test(s);
@@ -1103,16 +1111,14 @@ client.on('messageCreate', async (message) => {
   }
 
   if (content === '!plans') {
-    const { data: user, error: userError } = await supabase
-      .from('users').select('repme_code').eq('user_id', userId).single();
+    const { user, error: userError } = await findUserByDiscordId(userId);
     if (userError || !user) return message.reply('先に !link で連携して');
     const tasks = await getScheduledPlans(user.repme_code);
     return message.reply(formatPlanList(tasks));
   }
 
   if (content === '!unplan') {
-    const { data: user, error: userError } = await supabase
-      .from('users').select('repme_code').eq('user_id', userId).single();
+    const { user, error: userError } = await findUserByDiscordId(userId);
     if (userError || !user) return message.reply('先に !link で連携して');
     const tasks = await getScheduledPlans(user.repme_code);
     if (tasks.length === 0) return message.reply('削除できる予定がありません');
@@ -1152,7 +1158,7 @@ client.on('messageCreate', async (message) => {
     const parts = content.split(/\s+/);
     const day = parts[1], start = parts[2], end = parts[3];
     if (!day || !start || !end || !dayMap[day]) return message.reply('使い方: !schedule 月 18:00 22:00');
-    const { data: user, error: userError } = await supabase.from('users').select('repme_code').eq('user_id', userId).single();
+    const { data: user, error: userError } = await findUserByDiscordId(userId);
     if (userError || !user) return message.reply('先に !link で連携して');
     const { error } = await supabase.from('weekly_plans').insert([{ repme_code: user.repme_code, user_id: userId, day_of_week: dayMap[day], start_time: start, end_time: end }]);
     if (error) { console.error('!schedule insert失敗', error); return message.reply('週間登録失敗'); }
@@ -1161,7 +1167,7 @@ client.on('messageCreate', async (message) => {
 
   if (content.startsWith('!schedulebulk')) {
     const lines = content.split('\n');
-    const { data: user, error: userError } = await supabase.from('users').select('repme_code').eq('user_id', userId).single();
+    const { data: user, error: userError } = await findUserByDiscordId(userId);
     if (userError || !user) return message.reply('先に !link で連携して');
     for (const line of lines) {
       const match = line.match(/([月火水木金土日])[:：]\s*(\d{1,2}:\d{2})-(\d{1,2}:\d{2})/);
@@ -1177,8 +1183,7 @@ client.on('messageCreate', async (message) => {
   // ========================================
 
   if (content.startsWith('!absent')) {
-    const { data: user, error: userError } = await supabase
-      .from('users').select('repme_code').eq('user_id', userId).single();
+    const { user, error: userError } = await findUserByDiscordId(userId);
     if (userError || !user) return message.reply('先に !link で連携して');
 
     const reportDate = parseReportDate(content);
@@ -1214,7 +1219,7 @@ client.on('messageCreate', async (message) => {
 
   if (content === '!in') {
     if (sessions[userId]) return message.reply('すでに作業中');
-    const { data: user, error: userError } = await supabase.from('users').select('repme_code').eq('user_id', userId).single();
+    const { data: user, error: userError } = await findUserByDiscordId(userId);
     if (userError || !user) return message.reply('先に !link で連携して');
 
     const today = getTodayJST();
@@ -1248,7 +1253,7 @@ client.on('messageCreate', async (message) => {
 
     if (!task) {
       sessions[userId] = { start: Date.now(), userName, repmeCode: user.repme_code, taskId: null, planType: null, taskEndTime: null };
-      await message.reply('作業開始。終わったら !out して');
+      await message.reply('作業開始');
       await advanceTutorialOnGuildAction(userId, 'in');
       return;
     }
@@ -1258,7 +1263,7 @@ client.on('messageCreate', async (message) => {
         await supabase.from('schedule_tasks').update({ status: 'in_progress' }).eq('id', task.id);
       }
       sessions[userId] = { start: Date.now(), userName, repmeCode: user.repme_code, taskId: task.id, planType: 'start', taskEndTime: null };
-      await message.reply(`作業開始: ${task.title || '今日の目標'}`);
+      await message.reply('作業開始');
       await advanceTutorialOnGuildAction(userId, 'in');
       return;
     }
@@ -1269,7 +1274,7 @@ client.on('messageCreate', async (message) => {
     }
 
     sessions[userId] = { start: Date.now(), userName, repmeCode: user.repme_code, taskId: task.id, planType: 'schedule', taskEndTime: task.end_time || null };
-    await message.reply(`作業開始: ${task.title || '作業'}`);
+    await message.reply('作業開始');
     await advanceTutorialOnGuildAction(userId, 'in');
     return;
   }
