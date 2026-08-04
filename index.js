@@ -1263,7 +1263,7 @@ client.on('messageCreate', async (message) => {
         await supabase.from('schedule_tasks').update({ status: 'in_progress' }).eq('id', task.id);
       }
       sessions[userId] = { start: Date.now(), userName, repmeCode: user.repme_code, taskId: task.id, planType: 'start', taskEndTime: null };
-      await message.reply('作業開始');
+      await message.reply(`作業開始：${task.title || '今日の目標'}`);
       await advanceTutorialOnGuildAction(userId, 'in');
       return;
     }
@@ -1274,7 +1274,7 @@ client.on('messageCreate', async (message) => {
     }
 
     sessions[userId] = { start: Date.now(), userName, repmeCode: user.repme_code, taskId: task.id, planType: 'schedule', taskEndTime: task.end_time || null };
-    await message.reply('作業開始');
+    await message.reply(`作業開始：${task.title || '作業'}`);
     await advanceTutorialOnGuildAction(userId, 'in');
     return;
   }
