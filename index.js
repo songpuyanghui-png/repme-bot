@@ -1038,7 +1038,7 @@ client.on('messageCreate', async (message) => {
     if (!parts[1]) return message.reply('使い方: !startplan 60');
     const targetMinutes = parseInt(parts[1], 10);
     if (isNaN(targetMinutes) || targetMinutes <= 0) return message.reply('分数は1以上の整数で入力して');
-    const { data: user, error: userError } = await findUserByDiscordId(userId);
+    const { user, error: userError } = await findUserByDiscordId(userId);
     if (userError || !user) return message.reply('先に !link で連携して');
     const { error: planError } = await supabase.from('plans').insert([{
       user_id: userId, repme_code: user.repme_code, plan_type: 'start', target_minutes: targetMinutes
@@ -1070,7 +1070,7 @@ client.on('messageCreate', async (message) => {
   if (content.startsWith('!plan') && !content.startsWith('!plans')) {
     const parts = content.split(/\s+/);
     if (parts.length < 2) return message.reply('使い方: !plan 14:00 タイトル / !plan 4/17 14:00 タイトル');
-    const { data: user, error: userError } = await findUserByDiscordId(userId);
+    const { user, error: userError } = await findUserByDiscordId(userId);
     if (userError || !user) return message.reply('先に !link で連携して');
     const isTimeStr = (s) => /^\d{1,2}:\d{2}$/.test(s);
     const isDateStr = (s) => /^\d{1,2}\/\d{1,2}$/.test(s);
@@ -1158,7 +1158,7 @@ client.on('messageCreate', async (message) => {
     const parts = content.split(/\s+/);
     const day = parts[1], start = parts[2], end = parts[3];
     if (!day || !start || !end || !dayMap[day]) return message.reply('使い方: !schedule 月 18:00 22:00');
-    const { data: user, error: userError } = await findUserByDiscordId(userId);
+    const { user, error: userError } = await findUserByDiscordId(userId);
     if (userError || !user) return message.reply('先に !link で連携して');
     const { error } = await supabase.from('weekly_plans').insert([{ repme_code: user.repme_code, user_id: userId, day_of_week: dayMap[day], start_time: start, end_time: end }]);
     if (error) { console.error('!schedule insert失敗', error); return message.reply('週間登録失敗'); }
@@ -1167,7 +1167,7 @@ client.on('messageCreate', async (message) => {
 
   if (content.startsWith('!schedulebulk')) {
     const lines = content.split('\n');
-    const { data: user, error: userError } = await findUserByDiscordId(userId);
+    const { user, error: userError } = await findUserByDiscordId(userId);
     if (userError || !user) return message.reply('先に !link で連携して');
     for (const line of lines) {
       const match = line.match(/([月火水木金土日])[:：]\s*(\d{1,2}:\d{2})-(\d{1,2}:\d{2})/);
@@ -1219,7 +1219,7 @@ client.on('messageCreate', async (message) => {
 
   if (content === '!in') {
     if (sessions[userId]) return message.reply('すでに作業中');
-    const { data: user, error: userError } = await findUserByDiscordId(userId);
+    const { user, error: userError } = await findUserByDiscordId(userId);
     if (userError || !user) return message.reply('先に !link で連携して');
 
     const today = getTodayJST();
